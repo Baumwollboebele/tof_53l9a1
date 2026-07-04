@@ -1,0 +1,63 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}"
+  },
+  "tasks": [
+    {
+      "label": "CMake: Configure",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "-B", "build",
+        "-G", "Ninja",
+        "-DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake",
+        "-DCMAKE_BUILD_TYPE=Release"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Build",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--build", "build"],
+      "dependsOn": "CMake: Configure",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "pyOCD: Install H533 pack (one-time)",
+      "type": "shell",
+      "command": "pyocd",
+      "args": ["pack", "install", "stm32h533retx"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Flash & Run (pyOCD)",
+      "type": "shell",
+      "command": "pyocd",
+      "args": [
+        "flash",
+        "--target", "stm32h533retx",
+        "build/53L9A1_LiveDepth.hex"
+      ],
+      "dependsOn": "Build",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Reset & Run (pyOCD)",
+      "type": "shell",
+      "command": "pyocd",
+      "args": ["reset", "--target", "stm32h533retx"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Live view (Python)",
+      "type": "shell",
+      "command": "python",
+      "args": ["tools/live_view.py"],
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# Build output
+/build/
+
+# Editor/IDE
+*.launch
+
+# OS
+.DS_Store
+Thumbs.db

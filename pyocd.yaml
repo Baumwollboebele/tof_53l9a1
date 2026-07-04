@@ -1,0 +1,14 @@
+# pyOCD configuration for the NUCLEO-H533RE.
+#
+# With this file in the working directory you can run pyOCD without repeating
+# the target on the command line, e.g.:
+#     pyocd flash build/53L9A1_LiveDepth.hex
+#     pyocd reset
+#
+# The STM32H533 target comes from the Keil STM32H5xx device family pack, which
+# you install once with:
+#     pyocd pack install stm32h533retx
+target_override: stm32h533retx
+
+# Nucleo on-board debugger is an ST-Link.
+# (pyOCD auto-detects it; no probe uid needed for a single board.)

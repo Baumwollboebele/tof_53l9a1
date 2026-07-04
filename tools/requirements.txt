@@ -1,0 +1,16 @@
+# SWD live viewer (swd_view.py) - the working transport on this board:
+pyocd>=0.35
+numpy>=1.21
+opencv-python>=4.5   # image rendering (all viewers) + smooth detection upscale
+PySide6>=6.4         # the desktop app (tof_gui.py)
+# optional: 3D point-cloud view in tof_gui.py
+# pyqtgraph>=0.13
+# PyOpenGL>=3.1
+matplotlib>=3.5      # only for the matplotlib viewers (tof_app.py / swd_view.py)
+scipy>=1.7   # optional: better heuristic masks (connected components); numpy fallback if absent
+
+# optional: deep-learning object detection (--detector yolo). Heavy - pulls in torch.
+# ultralytics>=8.0
+
+# Only needed for the (non-working on this board) UART viewer live_view.py:
+pyserial>=3.5
