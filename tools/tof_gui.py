@@ -33,7 +33,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QLabel, QWidget, QVBoxLayout, QHBoxLayout,
         QComboBox, QSlider, QCheckBox, QGroupBox, QFormLayout, QLineEdit, QFrame,
-        QPushButton)
+        QPushButton, QScrollArea, QFileDialog)
 except ImportError:
     sys.exit("PySide6 is required:  pip install PySide6")
 
@@ -161,6 +161,8 @@ class ToFWindow(QMainWindow):
         self.last_seq, self.t_prev, self.fps_meas = -1, time.time(), 0.0
         self.bg = self.prev_depth = None        # background model / previous depth
         self.pcl_win, self._pcl_err = None, None
+        self._upsampler, self._dl_err = None, None
+        self.mapper, self.mapping, self._map_seq = None, False, -1
         self._motion, self._presence, self._fg_frac = 0.0, None, 0.0
 
         # ---- image ----
@@ -218,6 +220,10 @@ class ToFWindow(QMainWindow):
         fp2.addRow(self.bilateral)
         br = QHBoxLayout(); br.addWidget(self.bstrength); br.addWidget(self.bstrength_lbl)
         wbr = QWidget(); wbr.setLayout(br); fp2.addRow("Smooth strength", wbr)
+        self.dl_up = QCheckBox("DL upsample (FSRCNN)")
+        self.dl_scale = QComboBox(); self.dl_scale.addItems(["x2", "x3", "x4"])
+        ur = QHBoxLayout(); ur.addWidget(self.dl_up); ur.addWidget(self.dl_scale)
+        wur = QWidget(); wur.setLayout(ur); fp2.addRow(wur)
         self.temporal.valueChanged.connect(lambda v: self.temporal_lbl.setText("off" if v <= 1 else str(v)))
         self.bstrength.valueChanged.connect(lambda v: self.bstrength_lbl.setText(str(v)))
 
@@ -234,13 +240,31 @@ class ToFWindow(QMainWindow):
         self.bg_thr.valueChanged.connect(lambda v: self.bg_thr_lbl.setText(f"{v} cm"))
         self.bg_learn.clicked.connect(self.learn_bg)
 
+        # ---- 3D map recording (ICP + TSDF, see mapper.py) ----
+        self.map_btn = QPushButton("Start recording")
+        self.map_show = QCheckBox("Show map in 3D window"); self.map_show.setChecked(True)
+        self.map_save = QPushButton("Save mesh (.ply)"); self.map_save.setEnabled(False)
+        self.map_reset = QPushButton("Reset")
+        self.map_lbl = QLabel("idle"); self.map_lbl.setObjectName("stat")
+        m3 = QGroupBox("3D map (record && move sensor slowly)")
+        fm3 = QFormLayout(m3)
+        fm3.addRow(self.map_btn); fm3.addRow(self.map_show)
+        m3r = QHBoxLayout(); m3r.addWidget(self.map_save); m3r.addWidget(self.map_reset)
+        wm3 = QWidget(); wm3.setLayout(m3r); fm3.addRow(wm3)
+        fm3.addRow(self.map_lbl)
+        self.map_btn.clicked.connect(self.toggle_mapping)
+        self.map_save.clicked.connect(self.save_map)
+        self.map_reset.clicked.connect(self.reset_map)
+
         panel = QVBoxLayout()
-        for g in (disp, proc, sens, det, mp, info):
+        for g in (disp, proc, sens, det, mp, m3, info):
             panel.addWidget(g)
         panel.addStretch(1)
-        pw = QWidget(); pw.setLayout(panel); pw.setFixedWidth(320)
+        pw = QWidget(); pw.setLayout(panel)
+        sc = QScrollArea(); sc.setWidget(pw); sc.setWidgetResizable(True)
+        sc.setFixedWidth(345); sc.setFrameShape(QFrame.NoFrame)
 
-        root = QHBoxLayout(); root.addWidget(self.view, 1); root.addWidget(pw)
+        root = QHBoxLayout(); root.addWidget(self.view, 1); root.addWidget(sc)
         c = QWidget(); c.setLayout(root); self.setCentralWidget(c)
 
         # ---- signals ----
@@ -287,6 +311,54 @@ class ToFWindow(QMainWindow):
         if self.dist is not None:
             self.bg = np.asarray(self.dist, dtype=np.float32).copy()
 
+    # ---- 3D map recording ----
+    def toggle_mapping(self):
+        if not self.mapping:
+            try:
+                if self.mapper is None:
+                    from mapper import DepthMapper  # lazy: needs scipy
+                    self.mapper = DepthMapper(hfov_deg=self.hfov)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                self.map_lbl.setText(("mapper unavailable: " + str(e))[:60])
+                return
+            # points beyond the display "Max dist" are excluded from the map,
+            # so a turntable-style scan can cut away the background
+            self.mapper.depth_max = self.dmax.value() / 100.0
+            self.mapping = True
+            self.map_btn.setText("Stop recording")
+            self.map_lbl.setText("recording ... move slowly")
+        else:
+            self.mapping = False
+            self.map_btn.setText("Start recording")
+            if self.mapper is not None and self.mapper.keyframes:
+                self.map_lbl.setText(f"stopped: {self.mapper.tracked} frames, "
+                                     f"{len(self.mapper.keyframes)} keyframes")
+
+    def reset_map(self):
+        if self.mapper is not None:
+            self.mapper.reset()
+        self._map_seq = -1
+        self.map_save.setEnabled(False)
+        self.map_lbl.setText("map cleared")
+
+    def save_map(self):
+        if self.mapper is None or not self.mapper.keyframes:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save 3D map", "tof_map.ply", "PLY mesh (*.ply)")
+        if not path:
+            return
+        self.map_lbl.setText("meshing ...")
+        QApplication.processEvents()
+        try:
+            self.map_lbl.setText(self.mapper.finish(path))
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            self.map_lbl.setText(("save failed: " + str(e))[:60])
+
     def ensure_pcl(self):
         if self.pcl_win is not None:
             if not self.pcl_win.isVisible():
@@ -296,6 +368,8 @@ class ToFWindow(QMainWindow):
             self.pcl_win = PointCloudWindow(); self.pcl_win.show(); self._pcl_err = None
             return True
         except Exception as e:  # noqa: BLE001  (pyqtgraph/PyOpenGL missing, etc.)
+            import traceback
+            traceback.print_exc()
             self._pcl_err = ("pip install pyqtgraph PyOpenGL"
                              if isinstance(e, ModuleNotFoundError) else str(e))
             self.pcl.setChecked(False)
@@ -327,6 +401,21 @@ class ToFWindow(QMainWindow):
             s = float(self.bstrength.value())
             dist = cv2.bilateralFilter(dist, 5, s * 10.0, 5.0)       # edge-preserving
             amp = cv2.bilateralFilter(amp, 5, max(s * 5.0, 10.0), 5.0)
+        if self.dl_up.isChecked():
+            scale = 2 + self.dl_scale.currentIndex()
+            try:
+                if self._upsampler is None or self._upsampler.scale != scale:
+                    from upsampler import DeepUpsampler   # lazy: needs opencv-contrib
+                    self._upsampler = DeepUpsampler(scale)
+                dist = self._upsampler.upsample(dist)
+                amp = self._upsampler.upsample(amp)
+                amb = self._upsampler.upsample(amb)
+                self._dl_err = None
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                self._dl_err = str(e)
+                self.dl_up.setChecked(False)
         return dist, amp, amb
 
     # ---- frame loop ----
@@ -344,6 +433,7 @@ class ToFWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             return
         self.dist, self.amp, self.amb = self.process(raw, w, h)
+        h, w = self.dist.shape  # DL upsample may have grown the working grid
         view = VIEW_CHANNELS[self.chan.currentIndex()]
         if view == "snr":
             chan = self.amp / (self.amb + 1.0)   # confidence: signal / ambient noise floor
@@ -423,21 +513,49 @@ class ToFWindow(QMainWindow):
             d_big = cv2.resize(dd, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
             col[sobel_binary(d_big)] = (255, 255, 0)  # cyan edges
 
-        # 3D point cloud (pop-out window)
-        if self.pcl.isChecked() and self.dist is not None:
+        # 3D map recording (only feed genuinely new frames to ICP)
+        if self.mapping and self.mapper is not None and hd["seq"] != self._map_seq:
+            self._map_seq = hd["seq"]
+            try:
+                self.mapper.add_frame(self.dist, self.amp)
+                m = self.mapper
+                self.map_lbl.setText(
+                    f"{'LOST - move back' if m.lost else 'tracking'}  "
+                    f"fit {m.fitness:.2f}\n"
+                    f"frames {m.tracked}/{m.frames}  kf {len(m.keyframes)}  "
+                    f"map {len(m.map_pts)} pts")
+                self.map_save.setEnabled(bool(m.keyframes))
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                self.mapping = False
+                self.map_btn.setText("Start recording")
+                self.map_lbl.setText(("map error: " + str(e))[:60])
+
+        # 3D window: recorded map takes precedence over the live cloud
+        show_map = (self.map_show.isChecked() and self.mapper is not None
+                    and len(self.mapper.map_pts) > 0)
+        if (self.pcl.isChecked() or show_map) and self.dist is not None:
             if self.ensure_pcl():
                 try:
-                    pts, cols = depth_to_pointcloud(np.asarray(self.dist), self.hfov, dmax, cmap_id)
+                    if show_map:
+                        pts, cols = self.mapper.map_points()
+                    else:
+                        pts, cols = depth_to_pointcloud(
+                            np.asarray(self.dist), self.hfov, dmax, cmap_id)
                     self.pcl_win.set_points(pts, cols)
                 except Exception:  # noqa: BLE001
-                    pass
+                    import traceback
+                    traceback.print_exc()
         elif self.pcl_win is not None and self.pcl_win.isVisible():
             self.pcl_win.hide()
 
         self.view.set_bgr(col)
         self.frame_wh = (w, h, out_w, out_h)
 
-        lines = [f"{w}x{h}  usecase {hd['usecase']} bin{hd['binning']}",
+        res = f"{w}x{h}" if (w, h) == (hd["w"], hd["h"]) else \
+            f"{hd['w']}x{hd['h']} SR-> {w}x{h}"
+        lines = [f"{res}  usecase {hd['usecase']} bin{hd['binning']}",
                  f"{self.fps_meas:4.1f} fps   frame {hd['fc']}",
                  f"temp {hd['temp']}   dropped {hd['dropped']}",
                  f"motion {self._motion:.0f} mm"]
@@ -446,6 +564,8 @@ class ToFWindow(QMainWindow):
                          f"presence: {'YES' if self._presence else 'no'}  fg {self._fg_frac * 100:.0f}%")
         if self._pcl_err:
             lines.append("3D unavailable:\n " + self._pcl_err[:24])
+        if self._dl_err:
+            lines.append("DL upsample unavailable:\n " + self._dl_err[:24])
         if self.detect.isChecked():
             if self.det_err:
                 lines.append("detector error:\n " + self.det_err[:26])

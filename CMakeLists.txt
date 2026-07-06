@@ -24,9 +24,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---- repo layout ----------------------------------------------------------
-# This project lives at Projects/NUCLEO-H533RE/Applications/53L9A1/53L9A1_LiveDepth
-# so the package root is five directories up.
-get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
+# The X-CUBE-53L9A1 expansion package (Drivers/Middlewares/Utilities) is
+# vendored inside this repository.
+set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/X-CUBE-53L9A1/STM32CubeExpansion_53L9A1_V1.0.0")
 set(PROJ_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
 set(TARGET 53L9A1_LiveDepth)
