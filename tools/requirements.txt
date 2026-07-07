@@ -7,8 +7,11 @@ PySide6>=6.4         # the desktop app (tof_gui.py)
 pyqtgraph>=0.13
 PyOpenGL>=3.1
 matplotlib>=3.5      # only for the matplotlib viewers (tof_app.py / swd_view.py)
-scipy>=1.7   # heuristic masks + ICP tracking for the 3D map recorder (mapper.py)
+scipy>=1.7   # heuristic masks + outlier filter / recovery ICP (mapper.py)
 scikit-image>=0.22   # 3D map meshing (marching cubes); cloud-only export if absent
+
+# dev: unit tests for the 3D geometry + mapper (tools/tests)
+pytest>=7
 
 # optional: deep-learning object detection (--detector yolo). Heavy - pulls in torch.
 # ultralytics>=8.0

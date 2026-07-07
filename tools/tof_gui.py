@@ -6,6 +6,11 @@ A polished front-end over the SWD link: crisp upscaled image (OpenCV colormap),
 grouped controls, live stats, object detection with a "show only detected" mode,
 and pixel hover read-out. Reuses the rendering/detection from tof_cv.py.
 
+Threading: an AcquisitionWorker owns the pyOCD link (pyocd sessions are not
+thread-safe) and streams new frames to the GUI; a MappingWorker owns the
+DepthMapper so ICP/fusion never blocks the UI. The GUI thread only processes
+and renders.
+
 Usage:
     python tof_gui.py                       # YOLO detector (needs ultralytics)
     python tof_gui.py --detector heuristic  # no ML deps
@@ -13,12 +18,13 @@ Requires: PySide6, opencv-python, pyocd, numpy (+ ultralytics for --detector yol
 """
 
 import argparse
-import math
 import os
 import sys
+import threading
 import time
 import warnings
 from collections import Counter, deque
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -28,7 +34,7 @@ except ImportError:
     sys.exit("opencv-python is required:  pip install opencv-python")
 
 try:
-    from PySide6.QtCore import Qt, QTimer, Signal
+    from PySide6.QtCore import Qt, QThread, QTimer, Signal
     from PySide6.QtGui import QImage, QPixmap
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QLabel, QWidget, QVBoxLayout, QHBoxLayout,
@@ -37,6 +43,7 @@ try:
 except ImportError:
     sys.exit("PySide6 is required:  pip install PySide6")
 
+import tof3d
 import tof_link as TL
 from detector import make_detector
 from segmenter import sobel_binary
@@ -45,56 +52,231 @@ from tof_cv import render, draw_detections, _cmaps, CHANNELS, USECASES
 # selectable views: raw channels + a computed SNR (confidence) map
 VIEW_CHANNELS = list(CHANNELS) + ["snr"]
 
+CLOUD_COLORS = ["depth", "amplitude", "solid"]
 
-def depth_to_pointcloud(dist, hfov_deg, dmax, cmap_id):
-    """Convert a radial-distance depth map to a coloured 3-D point cloud.
 
-    Each pixel maps to a ray from the sensor FoV; the radial distance becomes a
-    perpendicular Z. Returns (pts Nx3 in metres [X right, Y up, Z forward],
-    rgba Nx4 in 0..1) coloured by distance. hfov_deg is the horizontal FoV
-    (vertical is derived from the frame aspect ratio - it is approximate)."""
-    h, w = dist.shape
-    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
-    hfov = math.radians(hfov_deg)
-    vfov = hfov * h / w
-    fx = (w / 2.0) / math.tan(hfov / 2.0)
-    fy = (h / 2.0) / math.tan(vfov / 2.0)
-    cc, rr_ = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    xx = (cc - cx) / fx
-    yy = (rr_ - cy) / fy
-    norm = np.sqrt(xx * xx + yy * yy + 1.0)
-    d = np.asarray(dist, dtype=np.float32)
-    z = d / norm                                   # radial -> perpendicular
-    valid = d > 0
-    pts = np.stack([(xx * z)[valid], -(yy * z)[valid], z[valid]], axis=1) / 1000.0
-    g = np.clip(d[valid] / max(dmax, 1), 0, 1)
-    gi = (g * 255).astype(np.uint8).reshape(-1, 1)
-    bgr = cv2.applyColorMap(gi, cmap_id).reshape(-1, 3).astype(np.float32) / 255.0
-    rgba = np.concatenate([bgr[:, ::-1], np.ones((len(bgr), 1), np.float32)], axis=1)
-    return pts, rgba
+@dataclass
+class FramePacket:
+    seq: int
+    w: int
+    h: int
+    binning: int
+    dist: np.ndarray
+    amp: np.ndarray
+    amb: np.ndarray
+    t: float
+    hdr: dict
+
+
+class AcquisitionWorker(QThread):
+    """Owns the SWD link: polls the header, reads only genuinely new frames,
+    applies queued sensor-control writes. Emits FramePackets to the GUI and
+    hands the same packet to the MappingWorker's mailbox (worker-to-worker,
+    so mapping rate is independent of GUI paint rate)."""
+
+    frame_ready = Signal(object)   # FramePacket
+    status = Signal(object)        # raw header dict while no valid frame
+
+    def __init__(self, link):
+        super().__init__()
+        self.link = link
+        self.mailbox = None        # optional MappingWorker
+        self._ctrl = deque()
+        self._halt = threading.Event()
+        self._gui_ack = threading.Event()
+        self._gui_ack.set()
+
+    def request_ctrl(self, usecase, fps):
+        self._ctrl.append((usecase, fps))
+
+    def ack(self):
+        self._gui_ack.set()
+
+    def stop(self):
+        self._halt.set()
+
+    def run(self):
+        last_seq = -1
+        while not self._halt.is_set():
+            try:
+                while self._ctrl:
+                    uc, fps = self._ctrl.popleft()
+                    self.link.send_ctrl(uc, fps)
+                hd = self.link.header()
+            except Exception:  # noqa: BLE001  (probe glitch: retry)
+                time.sleep(0.2)
+                continue
+            if hd["magic"] != TL.MAGIC or hd["w"] == 0 or \
+                    hd["w"] * hd["h"] > TL.MAX_PX:
+                self.status.emit(hd)
+                time.sleep(0.1)
+                continue
+            if hd["seq"] == last_seq:
+                time.sleep(0.004)
+                continue
+            w, h = hd["w"], hd["h"]
+            try:
+                dist, amp, amb = self.link.all_channels(w, h)
+            except Exception:  # noqa: BLE001
+                time.sleep(0.05)
+                continue
+            last_seq = hd["seq"]
+            pkt = FramePacket(hd["seq"], w, h, hd["binning"] or 2,
+                              dist, amp, amb, time.time(), hd)
+            if self.mailbox is not None:
+                self.mailbox.submit(pkt)
+            # drop GUI frames while the GUI is still busy with the last one
+            if self._gui_ack.is_set():
+                self._gui_ack.clear()
+                self.frame_ready.emit(pkt)
+
+
+class MappingWorker(QThread):
+    """Owns the DepthMapper. Frames arrive via a capacity-1 latest-frame-wins
+    mailbox (a stale frame only increases ICP inter-frame motion); commands
+    via a deque. A generation counter makes reset race-free: the GUI drops
+    results carrying a stale gen. Map updates are coalesced: at most one
+    in flight, at least 150 ms apart."""
+
+    map_updated = Signal(object)   # dict(gen, text, kf, npts[, pts, cols])
+    op_done = Signal(object)       # dict(gen, text) for finish()
+
+    def __init__(self, hfov=None):
+        super().__init__()
+        self.hfov = hfov
+        self._cond = threading.Condition()
+        self._slot = None
+        self._cmds = deque()
+        self._halt = threading.Event()
+        self._acked = threading.Event()
+        self._acked.set()
+        self._last_emit = 0.0
+
+    def submit(self, pkt):
+        with self._cond:
+            self._slot = pkt
+            self._cond.notify()
+
+    def send(self, *cmd):
+        self._cmds.append(cmd)
+        with self._cond:
+            self._cond.notify()
+
+    def ack(self):
+        self._acked.set()
+
+    def stop(self):
+        self._halt.set()
+        with self._cond:
+            self._cond.notify()
+
+    def _emit_update(self, gen, mapper, force=False, with_cloud=True):
+        now = time.time()
+        if not force and (now - self._last_emit < 0.15
+                          or not self._acked.is_set()):
+            return
+        d = dict(gen=gen, kf=len(mapper.keyframes), npts=len(mapper.vox),
+                 text=(f"{'LOST - move back' if mapper.lost else 'tracking'}  "
+                       f"fit {mapper.fitness:.2f}\n"
+                       f"frames {mapper.tracked}/{mapper.frames}  "
+                       f"kf {len(mapper.keyframes)}  map {len(mapper.vox)} vox"))
+        if with_cloud:
+            pts, cols = mapper.map_points()
+            d["pts"], d["cols"] = tof3d.to_display(pts), cols
+        self._acked.clear()
+        self._last_emit = now
+        self.map_updated.emit(d)
+
+    def run(self):
+        mapper, active, gen = None, False, 0
+        while not self._halt.is_set():
+            while self._cmds:
+                cmd = self._cmds.popleft()
+                if cmd[0] == "start":
+                    gen, depth_max = cmd[1], cmd[2]
+                    if mapper is None:
+                        try:
+                            from mapper import DepthMapper  # lazy: needs scipy
+                            mapper = DepthMapper(hfov_deg=self.hfov)
+                        except Exception as e:  # noqa: BLE001
+                            self.map_updated.emit(dict(
+                                gen=gen, kf=0, npts=0,
+                                text=("mapper unavailable: " + str(e))[:60]))
+                            continue
+                    mapper.depth_max = depth_max
+                    active = True
+                elif cmd[0] == "stop":
+                    active = False
+                    if mapper is not None:
+                        self.map_updated.emit(dict(
+                            gen=gen, kf=len(mapper.keyframes),
+                            npts=len(mapper.vox),
+                            text=(f"stopped: {mapper.tracked} frames, "
+                                  f"{len(mapper.keyframes)} keyframes")))
+                elif cmd[0] == "reset":
+                    gen = cmd[1]
+                    if mapper is not None:
+                        mapper.reset()
+                    self.map_updated.emit(dict(gen=gen, kf=0, npts=0,
+                                               text="map cleared"))
+                elif cmd[0] == "finish":
+                    g, path = cmd[1], cmd[2]
+                    try:
+                        txt = mapper.finish(path) if mapper is not None \
+                            else "no frames recorded"
+                    except Exception as e:  # noqa: BLE001
+                        txt = ("save failed: " + str(e))[:60]
+                    self.op_done.emit(dict(gen=g, text=txt))
+
+            pkt = None
+            with self._cond:
+                if self._slot is None and not self._cmds:
+                    self._cond.wait(0.1)
+                pkt, self._slot = self._slot, None
+            if pkt is None or not active or mapper is None:
+                continue
+            try:
+                mapper.add_frame(pkt.dist, pkt.amp, pkt.binning)
+                self._emit_update(gen, mapper)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                active = False
+                self.map_updated.emit(dict(gen=gen, kf=0, npts=0,
+                                           text=("map error: " + str(e))[:60]))
 
 
 class PointCloudWindow(QMainWindow):
-    """Pop-out rotatable 3-D view (needs pyqtgraph + PyOpenGL)."""
+    """Pop-out rotatable 3-D view (needs pyqtgraph + PyOpenGL). Z is up,
+    depth extends along the grid (tof3d.to_display frame)."""
 
     def __init__(self):
+        import pyqtgraph as pg
         import pyqtgraph.opengl as gl  # optional deps, imported lazily
         super().__init__()
+        self._pg = pg
         self.setWindowTitle("ToF 3D point cloud")
         self.resize(720, 620)
         self.view = gl.GLViewWidget()
         self.setCentralWidget(self.view)
-        self.view.setCameraPosition(distance=3.0, elevation=12, azimuth=-70)
+        self.view.setCameraPosition(distance=3.0, elevation=22, azimuth=-135)
         grid = gl.GLGridItem(); grid.setSize(4, 4); grid.setSpacing(0.25, 0.25)
         self.view.addItem(grid)
+        axis = gl.GLAxisItem(); axis.setSize(0.5, 0.5, 0.5)
+        self.view.addItem(axis)
         self._sp = gl.GLScatterPlotItem(pos=np.zeros((1, 3), np.float32), size=4)
         self.view.addItem(self._sp)
+        self._centered = False
 
-    def set_points(self, pts, colors):
+    def set_points(self, pts, colors, size=4):
         if len(pts) == 0:
             pts = np.zeros((1, 3), np.float32)
             colors = np.zeros((1, 4), np.float32)
-        self._sp.setData(pos=pts, color=colors, size=4)
+        elif not self._centered and len(pts) > 100:
+            c = np.median(pts, axis=0)
+            self.view.opts["center"] = self._pg.Vector(*c.tolist())
+            self._centered = True
+        self._sp.setData(pos=pts, color=colors, size=size)
 
 DARK = """
 QWidget { background:#20242b; color:#e6e6e6; font-size:12px; }
@@ -148,21 +330,24 @@ def slider(mn, mx, val, step=1):
 
 
 class ToFWindow(QMainWindow):
-    def __init__(self, link, detector, cmaps, hfov=60.0):
+    def __init__(self, link, detector, cmaps, hfov=None):
         super().__init__()
-        self.link, self.detector, self.cmaps, self.hfov = link, detector, cmaps, hfov
+        self.detector, self.cmaps, self.hfov = detector, cmaps, hfov
         self.setWindowTitle("VL53L9CX ToF")
         self.resize(1100, 640)
 
         self.dist = self.amp = self.amb = None
         self.frame_wh = None
+        self._pkt = None
         self._buf, self._buf_wh = {}, None  # temporal-denoise ring buffers
         self.last_dets, self.last_det_t, self.det_err = [], 0.0, None
-        self.last_seq, self.t_prev, self.fps_meas = -1, time.time(), 0.0
+        self.t_prev, self.fps_meas = time.time(), 0.0
         self.bg = self.prev_depth = None        # background model / previous depth
         self.pcl_win, self._pcl_err = None, None
         self._upsampler, self._dl_err = None, None
-        self.mapper, self.mapping, self._map_seq = None, False, -1
+        self.mapping = False
+        self._map_gen, self._map_kf, self._map_npts = 0, 0, 0
+        self._rec = None                        # raw-frame recorder state
         self._motion, self._presence, self._fg_frac = 0.0, None, 0.0
 
         # ---- image ----
@@ -185,7 +370,18 @@ class ToFWindow(QMainWindow):
         mr = QHBoxLayout(); mr.addWidget(self.minint); mr.addWidget(self.minint_lbl)
         wmr = QWidget(); wmr.setLayout(mr); f.addRow("Min intensity", wmr)
         self.edges = QCheckBox("Sobel edges overlay"); f.addRow(self.edges)
-        self.pcl = QCheckBox("3D point cloud (window)"); f.addRow(self.pcl)
+
+        # ---- 3D view ----
+        self.pcl = QCheckBox("3D point cloud (window)")
+        self.cloud_color = QComboBox(); self.cloud_color.addItems(["Depth", "Amplitude", "Solid"])
+        self.cloud_filter = QCheckBox("Noise filter (confidence + edges)")
+        self.cloud_filter.setChecked(True)
+        self.cloud_size = slider(1, 12, 4)
+        v3 = QGroupBox("3D view"); f3 = QFormLayout(v3)
+        f3.addRow(self.pcl)
+        f3.addRow("Cloud color", self.cloud_color)
+        f3.addRow(self.cloud_filter)
+        f3.addRow("Point size", self.cloud_size)
 
         self.uc = QComboBox(); self.uc.addItems(USECASES); self.uc.setCurrentIndex(1)
         self.fps = slider(1, 30, 15); self.fps_lbl = QLabel("15")
@@ -240,7 +436,7 @@ class ToFWindow(QMainWindow):
         self.bg_thr.valueChanged.connect(lambda v: self.bg_thr_lbl.setText(f"{v} cm"))
         self.bg_learn.clicked.connect(self.learn_bg)
 
-        # ---- 3D map recording (ICP + TSDF, see mapper.py) ----
+        # ---- 3D map recording (projective ICP + TSDF, see mapper.py) ----
         self.map_btn = QPushButton("Start recording")
         self.map_show = QCheckBox("Show map in 3D window"); self.map_show.setChecked(True)
         self.map_save = QPushButton("Save mesh (.ply)"); self.map_save.setEnabled(False)
@@ -256,8 +452,16 @@ class ToFWindow(QMainWindow):
         self.map_save.clicked.connect(self.save_map)
         self.map_reset.clicked.connect(self.reset_map)
 
+        # ---- raw capture (offline tuning / replay.py) ----
+        self.rec_btn = QPushButton("Record raw frames")
+        self.rec_lbl = QLabel("idle"); self.rec_lbl.setObjectName("stat")
+        cap = QGroupBox("Capture (raw .npz for replay.py)")
+        fc = QFormLayout(cap)
+        fc.addRow(self.rec_btn); fc.addRow(self.rec_lbl)
+        self.rec_btn.clicked.connect(self.toggle_record)
+
         panel = QVBoxLayout()
-        for g in (disp, proc, sens, det, mp, m3, info):
+        for g in (disp, v3, proc, sens, det, mp, m3, cap, info):
             panel.addWidget(g)
         panel.addStretch(1)
         pw = QWidget(); pw.setLayout(panel)
@@ -276,15 +480,26 @@ class ToFWindow(QMainWindow):
         self.uc.currentIndexChanged.connect(self.apply_settings)
         self.fps.sliderReleased.connect(self.apply_settings)
 
+        # ---- workers ----
+        self.acq = AcquisitionWorker(link)
+        self.map_worker = MappingWorker(hfov=self.hfov)
+        self.acq.mailbox = self.map_worker
+        self.acq.frame_ready.connect(self.on_frame)
+        self.acq.status.connect(self.on_status)
+        self.map_worker.map_updated.connect(self.on_map_update)
+        self.map_worker.op_done.connect(self.on_op_done)
+        self.map_worker.start()
+        self.acq.start()
         self.apply_settings()
-        self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(30)
+
+        # slow refresh so UI control changes take effect between frames
+        self.refresh = QTimer(self)
+        self.refresh.timeout.connect(self.render_frame)
+        self.refresh.start(150)
 
     # ---- control handlers ----
     def apply_settings(self):
-        try:
-            self.link.send_ctrl(self.uc.currentIndex(), self.fps.value())
-        except Exception:  # noqa: BLE001
-            pass
+        self.acq.request_ctrl(self.uc.currentIndex(), self.fps.value())
 
     def apply_classes(self):
         txt = self.classes.text().strip()
@@ -314,50 +529,97 @@ class ToFWindow(QMainWindow):
     # ---- 3D map recording ----
     def toggle_mapping(self):
         if not self.mapping:
-            try:
-                if self.mapper is None:
-                    from mapper import DepthMapper  # lazy: needs scipy
-                    self.mapper = DepthMapper(hfov_deg=self.hfov)
-            except Exception as e:  # noqa: BLE001
-                import traceback
-                traceback.print_exc()
-                self.map_lbl.setText(("mapper unavailable: " + str(e))[:60])
-                return
             # points beyond the display "Max dist" are excluded from the map,
             # so a turntable-style scan can cut away the background
-            self.mapper.depth_max = self.dmax.value() / 100.0
+            self.map_worker.send("start", self._map_gen, self.dmax.value() / 100.0)
             self.mapping = True
             self.map_btn.setText("Stop recording")
             self.map_lbl.setText("recording ... move slowly")
         else:
             self.mapping = False
             self.map_btn.setText("Start recording")
-            if self.mapper is not None and self.mapper.keyframes:
-                self.map_lbl.setText(f"stopped: {self.mapper.tracked} frames, "
-                                     f"{len(self.mapper.keyframes)} keyframes")
+            self.map_worker.send("stop",)
 
     def reset_map(self):
-        if self.mapper is not None:
-            self.mapper.reset()
-        self._map_seq = -1
+        self._map_gen += 1
+        self._map_kf, self._map_npts = 0, 0
+        self.map_worker.send("reset", self._map_gen)
         self.map_save.setEnabled(False)
         self.map_lbl.setText("map cleared")
+        if self.mapping:
+            self.map_worker.send("start", self._map_gen, self.dmax.value() / 100.0)
 
     def save_map(self):
-        if self.mapper is None or not self.mapper.keyframes:
+        if self._map_kf == 0:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save 3D map", "tof_map.ply", "PLY mesh (*.ply)")
         if not path:
             return
         self.map_lbl.setText("meshing ...")
-        QApplication.processEvents()
+        self.map_worker.send("finish", self._map_gen, path)
+
+    def on_map_update(self, d):
         try:
-            self.map_lbl.setText(self.mapper.finish(path))
-        except Exception as e:  # noqa: BLE001
-            import traceback
-            traceback.print_exc()
-            self.map_lbl.setText(("save failed: " + str(e))[:60])
+            if d.get("gen") != self._map_gen:
+                return
+            self._map_kf = d.get("kf", self._map_kf)
+            self._map_npts = d.get("npts", self._map_npts)
+            if d.get("text"):
+                self.map_lbl.setText(d["text"])
+            self.map_save.setEnabled(self._map_kf > 0)
+            pts = d.get("pts")
+            if pts is not None and self.map_show.isChecked() and len(pts) > 0 \
+                    and self.ensure_pcl():
+                self.pcl_win.set_points(pts, d["cols"], self.cloud_size.value())
+        finally:
+            self.map_worker.ack()
+
+    def on_op_done(self, d):
+        if d.get("gen") == self._map_gen:
+            self.map_lbl.setText(d["text"])
+
+    # ---- raw capture ----
+    def toggle_record(self):
+        if self._rec is None:
+            self._rec = dict(dist=[], amp=[], amb=[], seq=[], t=[],
+                             wh=None, binning=2, skipped=0)
+            self.rec_btn.setText("Stop && save .npz")
+            self.rec_lbl.setText("recording raw frames ...")
+            return
+        rec, self._rec = self._rec, None
+        self.rec_btn.setText("Record raw frames")
+        if not rec["dist"]:
+            self.rec_lbl.setText("nothing recorded")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save raw capture", "tof_capture.npz", "NumPy archive (*.npz)")
+        if not path:
+            self.rec_lbl.setText("discarded")
+            return
+        np.savez_compressed(
+            path, dist=np.stack(rec["dist"]), amp=np.stack(rec["amp"]),
+            amb=np.stack(rec["amb"]), seq=np.array(rec["seq"], np.int64),
+            t=np.array(rec["t"]), binning=rec["binning"])
+        self.rec_lbl.setText(f"{len(rec['dist'])} frames -> {os.path.basename(path)}")
+
+    def _record(self, pkt):
+        rec = self._rec
+        if rec["wh"] is None:
+            rec["wh"], rec["binning"] = (pkt.w, pkt.h), pkt.binning
+        if rec["wh"] != (pkt.w, pkt.h):
+            rec["skipped"] += 1
+            return
+        if len(rec["dist"]) >= 20000:       # ~250 MB uncompressed: hard stop
+            self.toggle_record()
+            return
+        rec["dist"].append(np.asarray(pkt.dist, np.uint16).copy())
+        rec["amp"].append(np.asarray(pkt.amp, np.uint16).copy())
+        rec["amb"].append(np.asarray(pkt.amb, np.uint16).copy())
+        rec["seq"].append(pkt.seq)
+        rec["t"].append(pkt.t)
+        self.rec_lbl.setText(f"recording ... {len(rec['dist'])} frames"
+                             + (f" ({rec['skipped']} skipped)" if rec["skipped"] else ""))
 
     def ensure_pcl(self):
         if self.pcl_win is not None:
@@ -418,33 +680,73 @@ class ToFWindow(QMainWindow):
                 self.dl_up.setChecked(False)
         return dist, amp, amb
 
-    # ---- frame loop ----
-    def tick(self):
-        try:
-            hd = self.link.header()
-        except Exception:  # noqa: BLE001
-            return
-        if hd["magic"] != TL.MAGIC or hd["w"] == 0 or hd["w"] * hd["h"] > TL.MAX_PX:
+    # ---- frame handling ----
+    def on_status(self, hd):
+        if self._pkt is None or time.time() - self._pkt.t > 1.0:
             self.stat.setText(f"no frame yet\nfsm={hd['fsm']}  power-cycle the board?")
-            return
-        w, h = hd["w"], hd["h"]
+
+    def on_frame(self, pkt):
         try:
-            raw = self.link.all_channels(w, h)
-        except Exception:  # noqa: BLE001
+            self._pkt = pkt
+            self.dist, self.amp, self.amb = self.process(
+                (pkt.dist, pkt.amp, pkt.amb), pkt.w, pkt.h)
+
+            now = time.time(); dt = now - self.t_prev; self.t_prev = now
+            if dt > 0:
+                self.fps_meas = 0.9 * self.fps_meas + 0.1 / dt
+
+            # motion metric (per new frame, not per repaint)
+            self._motion = 0.0
+            if self.prev_depth is not None and self.prev_depth.shape == self.dist.shape:
+                vv = (self.dist > 0) & (self.prev_depth > 0)
+                if vv.any():
+                    self._motion = float(np.abs(self.dist[vv] - self.prev_depth[vv]).mean())
+            self.prev_depth = np.asarray(self.dist, dtype=np.float32).copy()
+
+            if self._rec is not None:
+                self._record(pkt)
+
+            self.render_frame()
+            self.update_cloud()
+        finally:
+            self.acq.ack()
+
+    def update_cloud(self):
+        """Live point cloud from the current frame (the recorded map, when
+        shown, arrives via on_map_update and takes precedence)."""
+        show_map = self.map_show.isChecked() and self._map_npts > 0
+        if self.pcl.isChecked() and not show_map and self.dist is not None:
+            if self.ensure_pcl():
+                try:
+                    filt = self.cloud_filter.isChecked()
+                    pts, cols = tof3d.live_pointcloud(
+                        np.asarray(self.dist), self.amp,
+                        binning=self._pkt.binning if self._pkt else 2,
+                        hfov_deg=self.hfov,
+                        dmax_mm=max(200, self.dmax.value() * 10),
+                        amp_frac=0.05 if filt else 0.0,
+                        edge_jump=0.06 if filt else 0.0,
+                        color=CLOUD_COLORS[self.cloud_color.currentIndex()],
+                        cmap_id=self.cmaps[self.cmap.currentIndex()][1])
+                    self.pcl_win.set_points(pts, cols, self.cloud_size.value())
+                except Exception:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
+        elif not self.pcl.isChecked() and not show_map and \
+                self.pcl_win is not None and self.pcl_win.isVisible():
+            self.pcl_win.hide()
+
+    def render_frame(self):
+        pkt = self._pkt
+        if pkt is None or self.dist is None:
             return
-        self.dist, self.amp, self.amb = self.process(raw, w, h)
+        hd = pkt.hdr
         h, w = self.dist.shape  # DL upsample may have grown the working grid
         view = VIEW_CHANNELS[self.chan.currentIndex()]
         if view == "snr":
             chan = self.amp / (self.amb + 1.0)   # confidence: signal / ambient noise floor
         else:
             chan = {"distance": self.dist, "amplitude": self.amp, "ambient": self.amb}[view]
-
-        if hd["seq"] != self.last_seq:
-            now = time.time(); dt = now - self.t_prev; self.t_prev = now
-            if dt > 0:
-                self.fps_meas = 0.9 * self.fps_meas + 0.1 / dt
-            self.last_seq = hd["seq"]
 
         out_w = self.size.value(); out_h = int(round(out_w * h / w))
         cmap_id = self.cmaps[self.cmap.currentIndex()][1]
@@ -463,13 +765,7 @@ class ToFWindow(QMainWindow):
         else:
             self.minint_lbl.setText("off")
 
-        # motion + background subtraction / presence
-        self._motion = 0.0
-        if self.prev_depth is not None and self.prev_depth.shape == self.dist.shape:
-            vv = (self.dist > 0) & (self.prev_depth > 0)
-            if vv.any():
-                self._motion = float(np.abs(self.dist[vv] - self.prev_depth[vv]).mean())
-        self.prev_depth = np.asarray(self.dist, dtype=np.float32).copy()
+        # background subtraction / presence
         self._presence, self._fg_frac = None, 0.0
         if self.bg_sub.isChecked() and self.bg is not None and self.bg.shape == self.dist.shape:
             thr = self.bg_thr.value() * 10.0
@@ -513,43 +809,6 @@ class ToFWindow(QMainWindow):
             d_big = cv2.resize(dd, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
             col[sobel_binary(d_big)] = (255, 255, 0)  # cyan edges
 
-        # 3D map recording (only feed genuinely new frames to ICP)
-        if self.mapping and self.mapper is not None and hd["seq"] != self._map_seq:
-            self._map_seq = hd["seq"]
-            try:
-                self.mapper.add_frame(self.dist, self.amp)
-                m = self.mapper
-                self.map_lbl.setText(
-                    f"{'LOST - move back' if m.lost else 'tracking'}  "
-                    f"fit {m.fitness:.2f}\n"
-                    f"frames {m.tracked}/{m.frames}  kf {len(m.keyframes)}  "
-                    f"map {len(m.map_pts)} pts")
-                self.map_save.setEnabled(bool(m.keyframes))
-            except Exception as e:  # noqa: BLE001
-                import traceback
-                traceback.print_exc()
-                self.mapping = False
-                self.map_btn.setText("Start recording")
-                self.map_lbl.setText(("map error: " + str(e))[:60])
-
-        # 3D window: recorded map takes precedence over the live cloud
-        show_map = (self.map_show.isChecked() and self.mapper is not None
-                    and len(self.mapper.map_pts) > 0)
-        if (self.pcl.isChecked() or show_map) and self.dist is not None:
-            if self.ensure_pcl():
-                try:
-                    if show_map:
-                        pts, cols = self.mapper.map_points()
-                    else:
-                        pts, cols = depth_to_pointcloud(
-                            np.asarray(self.dist), self.hfov, dmax, cmap_id)
-                    self.pcl_win.set_points(pts, cols)
-                except Exception:  # noqa: BLE001
-                    import traceback
-                    traceback.print_exc()
-        elif self.pcl_win is not None and self.pcl_win.isVisible():
-            self.pcl_win.hide()
-
         self.view.set_bgr(col)
         self.frame_wh = (w, h, out_w, out_h)
 
@@ -577,6 +836,12 @@ class ToFWindow(QMainWindow):
         self.stat.setText("\n".join(lines))
 
     def closeEvent(self, ev):
+        for worker in (self.map_worker, self.acq):
+            try:
+                worker.stop()
+                worker.wait(3000)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             if self.pcl_win is not None:
                 self.pcl_win.close()
@@ -598,8 +863,8 @@ def main():
     ap.add_argument("--target", default="stm32h533retx")
     ap.add_argument("--detector", default="yolo", help="yolo | heuristic")
     ap.add_argument("--model", default="yolov8n-seg.pt")
-    ap.add_argument("--fov", type=float, default=60.0,
-                    help="horizontal field of view (deg) for the 3D point cloud")
+    ap.add_argument("--fov", type=float, default=None,
+                    help="override horizontal FoV (deg); default: ST optical model")
     args = ap.parse_args()
 
     det_kw = dict(model=args.model) if args.detector in ("yolo", "ultralytics", "dl") else {}
@@ -620,7 +885,10 @@ def main():
     win.session = session
     win.show()
     ret = app.exec()
-    session.close()
+    try:
+        session.close()
+    except Exception:  # noqa: BLE001  (already closed in closeEvent)
+        pass
     sys.exit(ret)
 
 
